@@ -33,12 +33,14 @@ JP_EX_SIZE = 96
 EN_EX_SIZE = 50
 
 # Text wrapping - maximum width for text (leaves margins on sides)
-TEXT_MAX_WIDTH = 1600  # pixels (out of 1920 total width)
+# Very conservative to prevent clipping - leave large margins
+TEXT_MAX_WIDTH = 1200  # pixels (out of 1920 total width, leaves 360px margin on each side)
 
 # Y positions (pixels) for info slide - adjusted to accommodate wrapped text
-READING_Y = 240
-JP_EX_Y = 380
-EN_EX_Y = 540
+# Give more vertical spacing to prevent clipping of multi-line text
+READING_Y = 220
+JP_EX_Y = 350
+EN_EX_Y = 500
 
 # Line spacing for wrapped text (pixels between lines)
 LINE_SPACING = 15
@@ -64,19 +66,23 @@ def ffmpeg_exists():
 
 def write_textfile(path: Path, text: str):
     # UTF-8 w/ LF is usually safest for FFmpeg drawtext on Windows
-    path.write_text(text if text is not None else "", encoding="utf-8", newline="\n")
+    # Ensure text is properly encoded and has no BOM
+    if text is None:
+        text = ""
+    # Remove any problematic characters and ensure clean newlines
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    path.write_text(text, encoding="utf-8", newline="\n")
 
 def wrap_text_for_display(text: str, max_width_px: int, font_size: int) -> str:
     """
     Manually wrap text to fit within max_width_px pixels.
-    Rough estimation: assume average character width is ~0.7 * font_size
+    Very conservative estimates to prevent clipping - uses safety margin.
     """
     if not text:
         return text
     
-    # Rough estimate: average char width is about 0.7 * font_size
-    # For Japanese characters, they're typically square, so font_size is a good approximation
-    chars_per_line = max(1, int(max_width_px / (font_size * 0.8)))
+    # Apply safety margin (15% reduction) to account for font rendering differences
+    safe_max_width = int(max_width_px * 0.85)
     
     words = text.split()
     if not words:
@@ -84,24 +90,38 @@ def wrap_text_for_display(text: str, max_width_px: int, font_size: int) -> str:
     
     lines = []
     current_line = []
-    current_length = 0
+    current_pixel_estimate = 0
     
     for word in words:
-        # For Japanese, count characters more accurately
-        word_length = len(word) + (1 if current_line else 0)  # +1 for space if not first word
-        if current_length + word_length <= chars_per_line:
+        # Very conservative width estimation
+        # CJK characters (Japanese/Chinese) as 1.1x font_size (account for full-width)
+        # Other characters as 0.65x font_size (account for variable width)
+        cjk_count = sum(1 for char in word if 
+                       '\u4e00' <= char <= '\u9fff' or  # CJK Unified Ideographs
+                       '\u3040' <= char <= '\u309f' or  # Hiragana
+                       '\u30a0' <= char <= '\u30ff')   # Katakana
+        other_count = len(word) - cjk_count
+        # Use slightly larger multipliers to be safe
+        word_width_px = (cjk_count * font_size * 1.1) + (other_count * font_size * 0.65)
+        space_width_px = font_size * 0.35 if current_line else 0
+        
+        if current_pixel_estimate + word_width_px + space_width_px <= safe_max_width:
             current_line.append(word)
-            current_length += word_length
+            current_pixel_estimate += word_width_px + space_width_px
         else:
             if current_line:
                 lines.append(" ".join(current_line))
             current_line = [word]
-            current_length = len(word)
+            current_pixel_estimate = word_width_px
     
     if current_line:
         lines.append(" ".join(current_line))
     
-    return "\n".join(lines)  # Actual newlines - FFmpeg textfile reads them as line breaks
+    # Join with newlines - ensure clean UTF-8 encoding
+    result = "\n".join(lines)
+    # Remove any problematic characters that might cause encoding issues
+    result = result.encode('utf-8', errors='ignore').decode('utf-8')
+    return result
 
 def make_clip(idx: int, word: str, reading: str, example_jp: str, example_en: str):
     # Create per-card textfiles (avoids escaping issues)
@@ -140,16 +160,17 @@ def make_clip(idx: int, word: str, reading: str, example_jp: str, example_en: st
     en_escaped = escape_path(en_txt)
 
     # Build filter string - use single quotes around paths to help FFmpeg parse
-    # Text is pre-wrapped in Python to prevent overflow
+    # Text is pre-wrapped in Python, and boxw constrains maximum width
+    # box=1 with boxborderw=0 creates invisible box to constrain text width
     vf = (
         f"drawtext=fontfile='{font_escaped}':textfile='{word_escaped}':fontsize={WORD_SIZE}:fontcolor=white:"
         f"x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,0,{WORD_S})',"
         f"drawtext=fontfile='{font_escaped}':textfile='{reading_escaped}':fontsize={READING_SIZE}:fontcolor=white:"
-        f"x=(w-text_w)/2:y={READING_Y}:enable='between(t,{info_start},{info_end})',"
+        f"box=1:boxborderw=0:boxw={TEXT_MAX_WIDTH}:x=(w-text_w)/2:y={READING_Y}:enable='between(t,{info_start},{info_end})',"
         f"drawtext=fontfile='{font_escaped}':textfile='{jp_escaped}':fontsize={JP_EX_SIZE}:fontcolor=white:"
-        f"x=(w-text_w)/2:y={JP_EX_Y}:enable='between(t,{info_start},{info_end})',"
+        f"box=1:boxborderw=0:boxw={TEXT_MAX_WIDTH}:x=(w-text_w)/2:y={JP_EX_Y}:enable='between(t,{info_start},{info_end})',"
         f"drawtext=fontfile='{font_escaped}':textfile='{en_escaped}':fontsize={EN_EX_SIZE}:fontcolor=white@0.92:"
-        f"x=(w-text_w)/2:y={EN_EX_Y}:enable='between(t,{info_start},{info_end})'"
+        f"box=1:boxborderw=0:boxw={TEXT_MAX_WIDTH}:x=(w-text_w)/2:y={EN_EX_Y}:enable='between(t,{info_start},{info_end})'"
     )
 
     cmd = [
